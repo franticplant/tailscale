@@ -311,7 +311,8 @@ type forwarder struct {
 
 	mu syncs.Mutex // guards following
 
-	dohClient map[string]*http.Client // urlBase -> client
+	dohClient    map[string]*http.Client // urlBase -> client
+	dohUseRoutes bool
 
 	// routes are per-suffix resolvers to use, with
 	// the most specific routes first.
@@ -490,12 +491,45 @@ func (f *forwarder) setRoutes(routesBySuffix map[dnsname.FQDN][]*dnstype.Resolve
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	useRoutes := ShouldUseRoutes(f.controlKnobs)
+	if f.dohUseRoutes != useRoutes {
+		f.closeDoHClientsLocked()
+		f.dohUseRoutes = useRoutes
+		if androidDNSConfigLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: route-aware dialing changed; cleared cached DoH clients useRoutes=%v", useRoutes)
+		}
+	}
 	f.acceptDNS = acceptDNS
 	f.routes = routes
 	f.cloudHostFallback = cloudHostFallback
 }
 
+func (f *forwarder) closeDoHClientsLocked() {
+	for _, c := range f.dohClient {
+		if tr, ok := c.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+	clear(f.dohClient)
+}
+
 var stdNetPacketListener nettype.PacketListenerWithNetIP = nettype.MakePacketListenerWithNetIP(new(net.ListenConfig))
+
+// AndroidDNSConfigLogEnabled reports whether Android-specific DNS config logs
+// should be emitted. It is set by tailscale-android when running on Android.
+var AndroidDNSConfigLogEnabled func() bool
+
+// AndroidDNSQueryLogEnabled reports whether Android-specific per-query DNS logs
+// should be emitted. It is set by tailscale-android when running on Android.
+var AndroidDNSQueryLogEnabled func() bool
+
+func androidDNSConfigLogEnabled() bool {
+	return AndroidDNSConfigLogEnabled != nil && AndroidDNSConfigLogEnabled()
+}
+
+func androidDNSQueryLogEnabled() bool {
+	return AndroidDNSQueryLogEnabled != nil && AndroidDNSQueryLogEnabled()
+}
 
 func (f *forwarder) packetListener(ip netip.Addr) (nettype.PacketListenerWithNetIP, error) {
 	if f.linkSel == nil || initListenConfig == nil {
@@ -571,8 +605,14 @@ const dohType = "application/dns-message"
 func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client, packet []byte) ([]byte, error) {
 	ctx = sockstats.WithSockStats(ctx, sockstats.LabelDNSForwarderDoH, f.logf)
 	metricDNSFwdDoH.Add(1)
+	if androidDNSQueryLogEnabled() {
+		f.logf("ANDROID_DNS_USAGE public DoH: forwarding DNS query via DoH resolver=%q bytes=%d useRoutes=%v", urlBase, len(packet), ShouldUseRoutes(f.controlKnobs))
+	}
 	req, err := http.NewRequestWithContext(ctx, "POST", urlBase, bytes.NewReader(packet))
 	if err != nil {
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: failed to build DoH request resolver=%q err=%v", urlBase, err)
+		}
 		return nil, err
 	}
 	req.Header.Set("Content-Type", dohType)
@@ -582,11 +622,17 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 	hres, err := c.Do(req)
 	if err != nil {
 		metricDNSFwdDoHErrorTransport.Add(1)
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: DoH transport error resolver=%q err=%v", urlBase, err)
+		}
 		return nil, err
 	}
 	defer hres.Body.Close()
 	if hres.StatusCode != 200 {
 		metricDNSFwdDoHErrorStatus.Add(1)
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: DoH HTTP status error resolver=%q status=%s", urlBase, hres.Status)
+		}
 		if hres.StatusCode/100 == 5 {
 			// Translate 5xx HTTP server errors into SERVFAIL DNS responses.
 			return nil, fmt.Errorf("%w: %s", errServerFailure, hres.Status)
@@ -595,14 +641,25 @@ func (f *forwarder) sendDoH(ctx context.Context, urlBase string, c *http.Client,
 	}
 	if ct := hres.Header.Get("Content-Type"); ct != dohType {
 		metricDNSFwdDoHErrorCT.Add(1)
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: DoH content-type error resolver=%q contentType=%q", urlBase, ct)
+		}
 		return nil, fmt.Errorf("unexpected response Content-Type %q", ct)
 	}
 	res, err := io.ReadAll(hres.Body)
 	if err != nil {
 		metricDNSFwdDoHErrorBody.Add(1)
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: failed reading DoH response resolver=%q err=%v", urlBase, err)
+		}
 	}
 	if truncatedFlagSet(res) {
 		metricDNSFwdTruncated.Add(1)
+	}
+	if err == nil {
+		if androidDNSQueryLogEnabled() {
+			f.logf("ANDROID_DNS_USAGE public DoH: DoH query succeeded resolver=%q responseBytes=%d", urlBase, len(res))
+		}
 	}
 	return res, err
 }
@@ -620,9 +677,29 @@ var (
 //
 // send expects the reply to have the same txid as txidOut.
 func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDelay) (ret []byte, err error) {
+	start := time.Now()
+	domain, typ, nameErr := nameFromQuery(fq.packet)
+	queryName := "<unparsed>"
+	queryType := "<unparsed>"
+	if nameErr == nil {
+		queryName = domain.WithTrailingDot()
+		queryType = typ.String()
+	}
+	useRoutes := ShouldUseRoutes(f.controlKnobs)
+	defer func() {
+		if !androidDNSQueryLogEnabled() {
+			return
+		}
+		duration := time.Since(start)
+		path := dnsUsagePathLabel(rr.name.Addr, useRoutes)
+		if err != nil {
+			f.logf("ANDROID_DNS_USAGE dns query result=error path=%s resolver=%q query=%q type=%s duration_ms=%d error_class=%s err=%v", path, rr.name.Addr, queryName, queryType, duration.Milliseconds(), dnsUsageErrorClass(err), err)
+			return
+		}
+		f.logf("ANDROID_DNS_USAGE dns query result=success path=%s resolver=%q query=%q type=%s duration_ms=%d response_bytes=%d", path, rr.name.Addr, queryName, queryType, duration.Milliseconds(), len(ret))
+	}()
 	if f.verboseFwd {
 		id := forwarderCount.Add(1)
-		domain, typ, _ := nameFromQuery(fq.packet)
 		f.logf("forwarder.send(%q, %d, %v, %d) from %v [%d] ...", rr.name.Addr, fq.txid, typ, len(domain), fq.src, id)
 		defer func() {
 			f.logf("forwarder.send(%q, %d, %v, %d) from %v [%d] = %v, %v", rr.name.Addr, fq.txid, typ, len(domain), fq.src, id, len(ret), err)
@@ -747,6 +824,52 @@ func (f *forwarder) send(ctx context.Context, fq *forwardQuery, rr resolverAndDe
 		return trErr.res, nil
 	}
 	return nil, err
+}
+
+func dnsUsagePathLabel(resolverAddr string, useRoutes bool) string {
+	switch {
+	case strings.HasPrefix(resolverAddr, "http://"):
+		if useRoutes {
+			return "tailscale-dns-proxy-route-aware"
+		}
+		return "tailscale-dns-proxy-system-route"
+	case strings.HasPrefix(resolverAddr, "https://"):
+		if useRoutes {
+			return "tailscale-selected-doh-route-aware"
+		}
+		return "tailscale-selected-doh-system-route"
+	default:
+		if useRoutes {
+			return "classic-dns-route-aware"
+		}
+		return "classic-dns-system-route"
+	}
+}
+
+func dnsUsageErrorClass(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return "timeout"
+	}
+	if errors.Is(err, errServerFailure) {
+		return "server-failure"
+	}
+	if errors.Is(err, errRefused) {
+		return "refused"
+	}
+	if errors.Is(err, errTxIDMismatch) {
+		return "txid-mismatch"
+	}
+	return "error"
 }
 
 type truncatedResponseError struct {

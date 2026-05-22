@@ -177,11 +177,16 @@ func (m *Manager) GetBaseConfig() (OSConfig, error) {
 func (m *Manager) setLocked(cfg Config) error {
 	syncs.AssertLocked(&m.mu)
 
+	effectiveCfg := *cfg.Clone()
+	for _, hook := range HookModifyConfig {
+		hook(&effectiveCfg)
+	}
+
 	m.logf("Set: %v", logger.ArgWriter(func(w *bufio.Writer) {
-		cfg.WriteToBufioWriter(w)
+		effectiveCfg.WriteToBufioWriter(w)
 	}))
 
-	rcfg, ocfg, err := m.compileConfig(cfg)
+	rcfg, ocfg, err := m.compileConfig(effectiveCfg)
 	if err != nil {
 		// On a compilation failure, set m.config set for later reuse by
 		// [Manager.RecompileDNSConfig] and return the error.
