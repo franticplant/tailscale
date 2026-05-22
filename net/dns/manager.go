@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"tailscale.com/control/controlknobs"
+	"tailscale.com/feature"
 	"tailscale.com/feature/buildfeatures"
 	"tailscale.com/health"
 	"tailscale.com/net/dns/resolver"
@@ -41,6 +42,14 @@ var (
 	// has no existing DNS configuration.
 	ErrNoDNSConfig = errors.New("no DNS configuration")
 )
+
+// HookModifyConfig allows platform clients to apply local, client-side DNS
+// policy before a DNS config is compiled into resolver and OS config.
+//
+// Hook functions must only mutate the provided temporary Config. Manager keeps
+// the original Config from control as its recompile source, so changing or
+// disabling a local hook can be applied by calling RecompileDNSConfig.
+var HookModifyConfig feature.Hooks[func(*Config)]
 
 // maxActiveQueries returns the maximal number of DNS requests that can
 // be running.
@@ -177,11 +186,16 @@ func (m *Manager) GetBaseConfig() (OSConfig, error) {
 func (m *Manager) setLocked(cfg Config) error {
 	syncs.AssertLocked(&m.mu)
 
+	effectiveCfg := cfg
+	for _, hook := range HookModifyConfig {
+		hook(&effectiveCfg)
+	}
+
 	m.logf("Set: %v", logger.ArgWriter(func(w *bufio.Writer) {
-		cfg.WriteToBufioWriter(w)
+		effectiveCfg.WriteToBufioWriter(w)
 	}))
 
-	rcfg, ocfg, err := m.compileConfig(cfg)
+	rcfg, ocfg, err := m.compileConfig(effectiveCfg)
 	if err != nil {
 		// On a compilation failure, set m.config set for later reuse by
 		// [Manager.RecompileDNSConfig] and return the error.
@@ -464,7 +478,7 @@ func toIPsOnly(resolvers []*dnstype.Resolver) (ret []netip.Addr) {
 // provided in bs as a wire-encoded DNS query without any transport header.
 // This method is called for requests arriving over UDP and TCP.
 //
-// The "family" parameter should indicate what type of DNS query this is:
+// The "family" parameter should indicate what type of DNS query is this:
 // either "tcp" or "udp".
 func (m *Manager) Query(ctx context.Context, bs []byte, family string, from netip.AddrPort) ([]byte, error) {
 	select {
@@ -654,7 +668,6 @@ func (m *Manager) FlushCaches() error {
 // CleanUp restores the system DNS configuration to its original state
 // in case the Tailscale daemon terminated without closing the router.
 // No other state needs to be instantiated before this runs.
-//
 // health must not be nil
 func CleanUp(logf logger.Logf, netMon *netmon.Monitor, bus *eventbus.Bus, health *health.Tracker, interfaceName string) {
 	if !buildfeatures.HasDNS {
