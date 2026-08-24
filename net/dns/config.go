@@ -16,6 +16,7 @@ import (
 
 	"tailscale.com/control/controlknobs"
 	"tailscale.com/envknob"
+	"tailscale.com/feature"
 	"tailscale.com/net/dns/publicdns"
 	"tailscale.com/net/dns/resolver"
 	"tailscale.com/net/tsaddr"
@@ -70,6 +71,10 @@ type Config struct {
 	// in the OS resolver path so the names still resolve.
 	MagicDNSHostsUnrouted bool
 }
+
+// HookModifyConfig allows platform-specific code to adjust DNS configuration
+// before it is compiled into resolver and OS configuration.
+var HookModifyConfig feature.Hooks[func(*Config)]
 
 var magicDNSDualStack = envknob.RegisterBool("TS_DEBUG_MAGIC_DNS_DUAL_STACK")
 
