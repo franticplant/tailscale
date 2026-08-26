@@ -167,6 +167,12 @@ func (e *Extension) onChangeProfile(profile ipn.LoginProfileView, _ ipn.PrefsVie
 			return
 		}
 
+		if newFileOps == nil {
+			e.logf("Taildrop disabled; no FileOps configured")
+			e.setMgrLocked(nil)
+			return
+		}
+
 		var err error
 		if fops, err = newFileOps(fileRoot); err != nil {
 			e.logf("taildrop: cannot create FileOps: %v", err)
