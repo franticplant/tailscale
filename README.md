@@ -1,3 +1,18 @@
+> ### This is a patched fork, not Tailscale's repository
+>
+> It exists to provide the core that
+> [Tailmesh](https://github.com/franticplant/tailmesh-android) builds against,
+> and is **not affiliated with, sponsored by, or endorsed by Tailscale Inc.**
+> Tailscale is a trademark of Tailscale Inc.
+>
+> Upstream — and what you almost certainly want instead — is
+> **https://github.com/tailscale/tailscale**.
+>
+> The `tailmesh-android-base` branch is the only one Tailmesh builds against. It
+> starts at a pinned upstream revision and adds two commits, documented in
+> [Tailmesh's build notes](https://github.com/franticplant/tailmesh-android/blob/main/docs/patches/build-and-maintenance.md).
+> Everything below this note is upstream's own README.
+
 # Tailscale
 
 https://tailscale.com
