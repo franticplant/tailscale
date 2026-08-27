@@ -49,7 +49,7 @@ jobs:
 
     # Install a more recent Go that understands modern go.mod content.
     - name: Install Go
-      uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # zizmor: ignore[cache-poisoning] v6.3.0
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # zizmor: ignore[cache-poisoning] v7.0.0
       with:
         go-version-file: go.mod
 
