@@ -888,8 +888,35 @@ func (s *Server) start() (reterr error) {
 	s.netstack = ns
 	s.dialer.UseNetstackForIP = func(ip netip.Addr) bool {
 		// s.lb is assigned below, before any dials can happen.
-		_, ok := s.lb.PeerForIP(ip)
-		return ok
+		if _, ok := s.lb.PeerForIP(ip); ok {
+			return true
+		}
+		// A destination that isn't one of this node's own peers is still
+		// routable through netstack when this node has an exit node
+		// configured: wgengine already programs the accepted exit peer's
+		// AllowedIPs to include the default route (0.0.0.0/0, ::/0), the
+		// same mechanism every other Tailscale client relies on to reach
+		// the general internet through an exit node. Without this check,
+		// Dial() for any non-peer destination fell through to SystemDial,
+		// silently bypassing the exit node (and Tailscale) entirely instead
+		// of routing through it as a caller with an exit node configured
+		// would expect.
+		//
+		// Restricted to addresses an exit node could plausibly carry:
+		// loopback/link-local/private destinations are never covered by an
+		// exit node's AllowedIPs and were never reachable via SystemDial's
+		// bypass either in any meaningful sense - routing them into the
+		// tailnet would just be a new way to fail where SystemDial's normal
+		// local-network handling already works correctly.
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsPrivate() || !ip.IsValid() {
+			return false
+		}
+		// Gated on Prefs rather than the resolved peer being reachable: a
+		// configured-but-currently-unreachable exit node should make a
+		// general dial fail closed through the real routing/timeout path,
+		// not silently and successfully bypass Tailscale.
+		prefs := s.lb.Prefs()
+		return prefs.ExitNodeIP().IsValid() || prefs.ExitNodeID() != ""
 	}
 	s.dialer.NetstackDialTCP = func(ctx context.Context, dst netip.AddrPort) (net.Conn, error) {
 		// Note: don't just return ns.DialContextTCP or we'll return
