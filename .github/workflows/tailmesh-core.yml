@@ -1,0 +1,71 @@
+name: Tailmesh core
+
+# CI for this fork's reason to exist: the patches Tailmesh (franticplant/
+# tailmesh-android) builds against. Tests the patched packages, and checks
+# they still cross-compile for Android, on every push to the branch the app
+# consumes.
+#
+# The upstream Tailscale workflows in this directory target upstream's main
+# branch and infrastructure; they are expected to stay disabled on this fork.
+
+on:
+  push:
+    branches:
+      - tailmesh-android-base
+  pull_request:
+    branches:
+      - tailmesh-android-base
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  patched-packages:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Cache Tailscale Go toolchain
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/tailscale-go
+          key: tailscale-go-${{ runner.os }}-${{ hashFiles('go.toolchain.rev') }}
+
+      - name: Cache Go modules and build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.toolchain.rev') }}-${{ hashFiles('go.sum') }}
+          restore-keys: go-${{ runner.os }}-${{ hashFiles('go.toolchain.rev') }}-
+
+      # Separate steps on purpose: upstream's TestForwarderRaceLoserNoReadError
+      # waits on real time and flakes when it shares the CPU with tsnet's tests
+      # (reproduced on unpatched upstream too).
+      - name: Test patched DNS and Taildrop packages
+        run: ./tool/go test ./net/dns/... ./feature/taildrop/...
+
+      - name: Test tsnet
+        run: ./tool/go test ./tsnet/...
+
+      - name: Race-test the DNS forwarder
+        run: ./tool/go test -race ./net/dns/resolver/...
+
+      - name: Cross-compile for Android
+        run: |
+          for arch in arm64 arm amd64 386; do
+            echo "android/$arch"
+            CGO_ENABLED=0 GOOS=android GOARCH=$arch ./tool/go build ./tsnet ./net/dns/... ./feature/taildrop/...
+          done
+
+      - name: go vet
+        run: ./tool/go vet ./net/dns/... ./feature/taildrop/... ./tsnet/...
