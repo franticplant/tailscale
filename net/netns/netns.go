@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/netip"
 	"runtime"
+	"sync"
 	"sync/atomic"
 
 	"tailscale.com/net/netknob"
@@ -47,13 +48,60 @@ func SetBindToInterfaceByRoute(logf logger.Logf, v bool) {
 }
 
 // When true, disableAndroidBindToActiveNetwork skips binding sockets to the currently
-// active network on Android.
+// active network on Android. It is the OR of the node attribute
+// (SetDisableAndroidBindToActiveNetwork) and the app's own choice
+// (SetAppDisableAndroidBindToActiveNetwork).
 var disableAndroidBindToActiveNetwork atomic.Bool
 
+// Tailmesh: the two inputs of disableAndroidBindToActiveNetwork. ipnlocal sets
+// the node attribute on every netmap, so without a separate app flag it would
+// overwrite an app's choice within seconds.
+var (
+	androidBindMu                  sync.Mutex
+	androidBindDisabledByNodeAttr  bool
+	androidBindDisabledByAppConfig bool
+)
+
 // SetDisableAndroidBindToActiveNetwork disables the default behavior of binding
-// sockets to the currently active network on Android.
+// sockets to the currently active network on Android. It is set from the
+// node attribute; binding stays disabled while either this or
+// SetAppDisableAndroidBindToActiveNetwork is true.
+//
+// The value is process-wide. In a process running several LocalBackends (one
+// per tsnet node, as Tailmesh's Multi-Tailnet does), each one calls this on
+// every netmap with its own node's attribute, so the most recent netmap wins.
+// That is upstream behavior and deliberately left unchanged here.
 func SetDisableAndroidBindToActiveNetwork(logf logger.Logf, v bool) {
-	if runtime.GOOS == "android" && disableAndroidBindToActiveNetwork.Swap(v) != v {
+	androidBindMu.Lock()
+	defer androidBindMu.Unlock()
+	androidBindDisabledByNodeAttr = v
+	updateDisableAndroidBindLocked(logf)
+}
+
+// SetAppDisableAndroidBindToActiveNetwork is the app's own switch for the same
+// behavior (Tailmesh patch). Netmap updates do not reset it. Like the node
+// attribute, it only affects sockets created after the change; existing
+// sockets keep their binding until they are re-created (e.g. a magicsock
+// rebind).
+func SetAppDisableAndroidBindToActiveNetwork(logf logger.Logf, v bool) {
+	androidBindMu.Lock()
+	defer androidBindMu.Unlock()
+	androidBindDisabledByAppConfig = v
+	updateDisableAndroidBindLocked(logf)
+}
+
+// AndroidBindToActiveNetworkDisabled reports whether new sockets skip binding
+// to the active network, and whether the node attribute alone would disable
+// it.
+func AndroidBindToActiveNetworkDisabled() (disabled, byNodeAttr bool) {
+	androidBindMu.Lock()
+	defer androidBindMu.Unlock()
+	return disableAndroidBindToActiveNetwork.Load(), androidBindDisabledByNodeAttr
+}
+
+func updateDisableAndroidBindLocked(logf logger.Logf) {
+	v := androidBindDisabledByNodeAttr || androidBindDisabledByAppConfig
+	if disableAndroidBindToActiveNetwork.Swap(v) != v && runtime.GOOS == "android" {
 		logf("netns: disableAndroidBindToActiveNetwork changed to %v", v)
 	}
 }
